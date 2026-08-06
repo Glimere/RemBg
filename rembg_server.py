@@ -9,6 +9,7 @@ from PIL import Image, ImageFilter
 import uvicorn
 import logging
 import os
+import concurrent.futures
 from contextlib import asynccontextmanager
 import asyncio
 
@@ -22,20 +23,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rembg_service")
 
-# Global session cache to avoid re-allocating models on every request
+# Global session cache & warmup executor
 session_cache = {}
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+warmup_task = None
+
+def _load_model_sync(model_name: str):
+    logger.info(f"Background thread pre-loading rembg session '{model_name}' on CPUExecutionProvider...")
+    try:
+        session = new_session(model_name, providers=["CPUExecutionProvider"])
+        session_cache["default"] = session
+        logger.info(f"Rembg session '{model_name}' pre-loaded successfully on CPU.")
+        return session
+    except Exception as e:
+        logger.warning(f"Failed to pre-load session '{model_name}': {e}. Will attempt fallback on request.")
+        return None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global warmup_task
     logger.info("Starting up Rembg Background Removal Service...")
     model_name = os.getenv("REMBG_MODEL", "u2net")
-    logger.info(f"Pre-loading rembg session with model '{model_name}' on CPUExecutionProvider...")
-    try:
-        # Force CPUExecutionProvider to avoid GPU device discovery failures in container environments
-        session_cache["default"] = new_session(model_name, providers=["CPUExecutionProvider"])
-        logger.info(f"Rembg session '{model_name}' pre-loaded successfully on CPU.")
-    except Exception as e:
-        logger.warning(f"Failed to pre-load session '{model_name}': {e}. Will attempt on-demand fallback.")
+    
+    # Launch model preloading in background thread so Uvicorn binds port instantly (prevents Render port scan timeout)
+    loop = asyncio.get_running_loop()
+    warmup_task = loop.run_in_executor(executor, _load_model_sync, model_name)
+    logger.info("Server port binding ready; model warming up in background.")
     
     try:
         yield
@@ -43,6 +56,7 @@ async def lifespan(app: FastAPI):
         pass
     finally:
         session_cache.clear()
+        executor.shutdown(wait=False)
         logger.info("Rembg Background Removal Service shut down cleanly.")
 
 app = FastAPI(title="Rembg Background Removal Service", lifespan=lifespan)
@@ -84,8 +98,14 @@ async def remove_background(
             logger.info(f"Downscaling image from {input_image.size} to max dimension {max_size}px to prevent memory spikes")
             input_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
         
-        # Retrieve pre-warmed session or fallback to on-demand CPU session
+        # Ensure session is ready (await background warmup if still running)
         session = session_cache.get("default")
+        if session is None and warmup_task is not None:
+            logger.info("Awaiting background model warmup completion...")
+            session = await asyncio.shield(warmup_task)
+            if session:
+                session_cache["default"] = session
+        
         if session is None:
             model_name = os.getenv("REMBG_MODEL", "u2net")
             logger.info(f"Initializing fallback session '{model_name}' with CPUExecutionProvider...")
@@ -131,7 +151,8 @@ async def remove_background(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "8000"))
-    logger.info(f"Launching server via uvicorn on port {port}...")
+    port = int(os.getenv("PORT", "10000"))
+    logger.info(f"Launching server via uvicorn on 0.0.0.0:{port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
 
