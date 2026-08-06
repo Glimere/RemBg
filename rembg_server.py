@@ -1,13 +1,14 @@
 # pyrefly: ignore [missing-import]
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 # pyrefly: ignore [missing-import]
 from fastapi.responses import StreamingResponse
-from rembg import remove
+from rembg import remove, new_session
 from io import BytesIO
 from PIL import Image, ImageFilter
 # pyrefly: ignore [missing-import]
 import uvicorn
 import logging
+import os
 from contextlib import asynccontextmanager
 import asyncio
 
@@ -21,24 +22,47 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rembg_service")
 
+# Global session cache to avoid re-allocating models on every request
+session_cache = {}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting up Rembg Background Removal Service...")
+    model_name = os.getenv("REMBG_MODEL", "u2net")
+    logger.info(f"Pre-loading rembg session with model '{model_name}' on CPUExecutionProvider...")
+    try:
+        # Force CPUExecutionProvider to avoid GPU device discovery failures in container environments
+        session_cache["default"] = new_session(model_name, providers=["CPUExecutionProvider"])
+        logger.info(f"Rembg session '{model_name}' pre-loaded successfully on CPU.")
+    except Exception as e:
+        logger.warning(f"Failed to pre-load session '{model_name}': {e}. Will attempt on-demand fallback.")
+    
     try:
         yield
     except asyncio.CancelledError:
-        # Suppress the harmless CancelledError thrown when pressing CTRL+C
         pass
     finally:
+        session_cache.clear()
         logger.info("Rembg Background Removal Service shut down cleanly.")
 
 app = FastAPI(title="Rembg Background Removal Service", lifespan=lifespan)
 
+@app.get("/", summary="Health check root endpoint")
+@app.get("/health", summary="Health check endpoint")
+async def health_check():
+    return {
+        "status": "ok",
+        "service": "rembg",
+        "model": os.getenv("REMBG_MODEL", "u2net"),
+        "session_ready": "default" in session_cache
+    }
+
 @app.post("/remove", summary="Remove background from an uploaded image")
 async def remove_background(
     file: UploadFile = File(...),
-    binarize_threshold: int = 127,
-    erode_size: int = 1
+    binarize_threshold: int = Query(127, description="Threshold for alpha channel binarization (0-255, 0 disables)"),
+    erode_size: int = Query(1, description="Pixel radius for alpha channel erosion (0 disables)"),
+    max_size: int = Query(2048, description="Maximum image dimension to prevent OOM on high-res uploads")
 ):
     logger.info(f"Received background removal request. Filename: {file.filename}, Content-Type: {file.content_type}")
     
@@ -55,9 +79,22 @@ async def remove_background(
         # Load the image using PIL
         input_image = Image.open(BytesIO(image_bytes))
         
-        # Use rembg to remove background
-        logger.info("Running rembg background removal...")
-        output_image = remove(input_image)
+        # Auto-downscale if image exceeds max_size to protect container memory limits
+        if max_size > 0 and (input_image.width > max_size or input_image.height > max_size):
+            logger.info(f"Downscaling image from {input_image.size} to max dimension {max_size}px to prevent memory spikes")
+            input_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        
+        # Retrieve pre-warmed session or fallback to on-demand CPU session
+        session = session_cache.get("default")
+        if session is None:
+            model_name = os.getenv("REMBG_MODEL", "u2net")
+            logger.info(f"Initializing fallback session '{model_name}' with CPUExecutionProvider...")
+            session = new_session(model_name, providers=["CPUExecutionProvider"])
+            session_cache["default"] = session
+        
+        # Run rembg background removal with the persistent CPU session
+        logger.info("Running rembg background removal inference...")
+        output_image = remove(input_image, session=session)
         
         # Convert to RGBA if not already
         if output_image.mode != "RGBA":
@@ -94,5 +131,7 @@ async def remove_background(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    logger.info("Launching server via uvicorn...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    logger.info(f"Launching server via uvicorn on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
