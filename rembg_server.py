@@ -2,7 +2,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 # pyrefly: ignore [missing-import]
 from fastapi.responses import StreamingResponse
-from rembg import remove, new_session
 from io import BytesIO
 from PIL import Image, ImageFilter
 # pyrefly: ignore [missing-import]
@@ -29,8 +28,10 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 warmup_task = None
 
 def _load_model_sync(model_name: str):
-    logger.info(f"Background thread pre-loading rembg session '{model_name}' on CPUExecutionProvider...")
+    logger.info(f"Background thread starting lazy load of rembg model '{model_name}' on CPUExecutionProvider...")
     try:
+        # Lazy import inside background thread to keep initial server startup time under 100ms
+        from rembg import new_session
         session = new_session(model_name, providers=["CPUExecutionProvider"])
         session_cache["default"] = session
         logger.info(f"Rembg session '{model_name}' pre-loaded successfully on CPU.")
@@ -45,10 +46,10 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up Rembg Background Removal Service...")
     model_name = os.getenv("REMBG_MODEL", "u2net")
     
-    # Launch model preloading in background thread so Uvicorn binds port instantly (prevents Render port scan timeout)
+    # Launch model preloading in background thread so Uvicorn binds port instantly (<100ms)
     loop = asyncio.get_running_loop()
     warmup_task = loop.run_in_executor(executor, _load_model_sync, model_name)
-    logger.info("Server port binding ready; model warming up in background.")
+    logger.info("Server port binding active; model warming up in background.")
     
     try:
         yield
@@ -106,6 +107,9 @@ async def remove_background(
             if session:
                 session_cache["default"] = session
         
+        # Lazy import remove and new_session
+        from rembg import remove, new_session
+        
         if session is None:
             model_name = os.getenv("REMBG_MODEL", "u2net")
             logger.info(f"Initializing fallback session '{model_name}' with CPUExecutionProvider...")
@@ -153,6 +157,7 @@ async def remove_background(
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     logger.info(f"Launching server via uvicorn on 0.0.0.0:{port}...")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run("rembg_server:app", host="0.0.0.0", port=port, log_level="info")
+
 
 
