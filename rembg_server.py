@@ -1,5 +1,7 @@
 # pyrefly: ignore [missing-import]
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends, Security
+# pyrefly: ignore [missing-import]
+from fastapi.security import APIKeyHeader
 # pyrefly: ignore [missing-import]
 from fastapi.responses import StreamingResponse
 from io import BytesIO
@@ -29,6 +31,19 @@ logger = logging.getLogger("rembg_service")
 session_cache = {}
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 warmup_task = None
+
+# Criteria 24 & 25: API Key Authentication for protected endpoints
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(x_api_key: str = Security(api_key_header)):
+    expected_api_key = os.getenv("REMBG_API_KEY")
+    if expected_api_key:
+        if not x_api_key or x_api_key != expected_api_key:
+            logger.warning("API key validation failed: invalid or missing X-API-Key header.")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing API key"
+            )
 
 def _load_model_sync(model_name: str):
     logger.info(f"Loading rembg model session '{model_name}' on CPUExecutionProvider...")
@@ -74,7 +89,7 @@ async def health_check():
         "session_ready": "default" in session_cache
     }
 
-@app.post("/remove", summary="Remove background from an uploaded image")
+@app.post("/remove", summary="Remove background from an uploaded image", dependencies=[Depends(verify_api_key)])
 async def remove_background(
     file: UploadFile = File(...),
     binarize_threshold: int = Query(127, description="Threshold for alpha channel binarization (0-255, 0 disables)"),
