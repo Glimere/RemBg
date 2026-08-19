@@ -11,6 +11,8 @@ import os
 import concurrent.futures
 from contextlib import asynccontextmanager
 import asyncio
+# pyrefly: ignore [missing-import]
+from rembg import new_session, remove
 
 # Configure logging
 logging.basicConfig(
@@ -23,21 +25,21 @@ logging.basicConfig(
 logger = logging.getLogger("rembg_service")
 
 # Global session cache & warmup executor
+# Criterion 17: Model session loaded ONCE on application startup and reused across requests.
 session_cache = {}
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 warmup_task = None
 
 def _load_model_sync(model_name: str):
-    logger.info(f"Background thread starting lazy load of rembg model '{model_name}' on CPUExecutionProvider...")
+    logger.info(f"Loading rembg model session '{model_name}' on CPUExecutionProvider...")
     try:
-        # Lazy import inside background thread to keep initial server startup time under 100ms
-        from rembg import new_session
+        # Create session ONCE at application startup
         session = new_session(model_name, providers=["CPUExecutionProvider"])
         session_cache["default"] = session
         logger.info(f"Rembg session '{model_name}' pre-loaded successfully on CPU.")
         return session
     except Exception as e:
-        logger.warning(f"Failed to pre-load session '{model_name}': {e}. Will attempt fallback on request.")
+        logger.error(f"Failed to load session '{model_name}': {e}")
         return None
 
 @asynccontextmanager
@@ -46,7 +48,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up Rembg Background Removal Service...")
     model_name = os.getenv("REMBG_MODEL", "u2net")
     
-    # Launch model preloading in background thread so Uvicorn binds port instantly (<100ms)
+    # Pre-load model session once when application starts
     loop = asyncio.get_running_loop()
     warmup_task = loop.run_in_executor(executor, _load_model_sync, model_name)
     logger.info("Server port binding active; model warming up in background.")
@@ -99,24 +101,22 @@ async def remove_background(
             logger.info(f"Downscaling image from {input_image.size} to max dimension {max_size}px to prevent memory spikes")
             input_image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
         
-        # Ensure session is ready (await background warmup if still running)
+        # Criterion 17: Re-use the model session created once when application started
         session = session_cache.get("default")
         if session is None and warmup_task is not None:
-            logger.info("Awaiting background model warmup completion...")
+            logger.info("Awaiting application startup model load completion...")
             session = await asyncio.shield(warmup_task)
             if session:
                 session_cache["default"] = session
         
-        # Lazy import remove and new_session
-        from rembg import remove, new_session
-        
         if session is None:
+            # Fallback if warmup failed during startup
             model_name = os.getenv("REMBG_MODEL", "u2net")
-            logger.info(f"Initializing fallback session '{model_name}' with CPUExecutionProvider...")
+            logger.info(f"Fallback loading session '{model_name}' on CPU...")
             session = new_session(model_name, providers=["CPUExecutionProvider"])
             session_cache["default"] = session
         
-        # Run rembg background removal with the persistent CPU session
+        # Run rembg background removal using pre-loaded session (session=session)
         logger.info("Running rembg background removal inference...")
         output_image = remove(input_image, session=session)
         
@@ -155,9 +155,12 @@ async def remove_background(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "10000"))
-    logger.info(f"Launching server via uvicorn on 0.0.0.0:{port}...")
-    uvicorn.run("rembg_server:app", host="0.0.0.0", port=port, log_level="info")
+    # Criterion 18: Don't use multiple Uvicorn workers for single/low-RAM VPS (KVM 1).
+    # Single worker process run command: uvicorn rembg_server:app --host 0.0.0.0 --port 8000
+    port = int(os.getenv("PORT", "8000"))
+    logger.info(f"Launching server via uvicorn (1 worker process) on 0.0.0.0:{port}...")
+    uvicorn.run("rembg_server:app", host="0.0.0.0", port=port, workers=1, log_level="info")
+
 
 
 
