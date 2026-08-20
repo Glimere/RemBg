@@ -170,7 +170,8 @@ async def remove_background(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Dynamically read host and port from environment variables
+    # Criterion 18: Single worker process for low-RAM environment.
+    # Dynamically read HOST and PORT environment variables (defaults: host=0.0.0.0, port=8000)
     host = os.getenv("HOST", "0.0.0.0")
     try:
         port = int(os.getenv("PORT", os.getenv("REMBG_PORT", "8000")))
