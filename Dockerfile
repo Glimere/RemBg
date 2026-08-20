@@ -2,28 +2,41 @@ FROM python:3.10-slim-bookworm
 
 WORKDIR /app
 
-# Force CPU execution, optimize single-core memory, and suppress ONNX GPU probing
+# CPU-only ONNX Runtime configuration
 ENV CUDA_VISIBLE_DEVICES=""
 ENV ORT_TENSORRT_UNAVAILABLE="1"
 ENV OMP_NUM_THREADS="1"
-ENV PYTHONUNBUFFERED="1"
-ENV PORT="7000"
+ENV OPENBLAS_NUM_THREADS="1"
+ENV MKL_NUM_THREADS="1"
 
+# Python configuration
+ENV PYTHONUNBUFFERED="1"
+ENV PYTHONDONTWRITEBYTECODE="1"
+
+# Application port
+ENV PORT="8000"
+
+# Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
     libgl1 \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Python dependencies
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download models on CPUExecutionProvider to avoid runtime download delays
-RUN python -c "from rembg import new_session; new_session('u2net', providers=['CPUExecutionProvider']); new_session('u2netp', providers=['CPUExecutionProvider'])"
+# Download U2NET during image build.
+# This prevents the application from downloading the model
+# when the container starts.
+RUN python -c "from rembg import new_session; new_session('u2net', providers=['CPUExecutionProvider'])"
 
+# Copy application
 COPY . .
 
-EXPOSE 7000
+# FastAPI listens internally on 8000
+EXPOSE 8000
 
+# Start the API
 CMD ["python", "rembg_server.py"]
