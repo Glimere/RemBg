@@ -170,11 +170,16 @@ async def remove_background(
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
-    # Criterion 18: Don't use multiple Uvicorn workers for single/low-RAM VPS (KVM 1).
-    # Single worker process run command: uvicorn rembg_server:app --host 0.0.0.0 --port 8000
-    port = int(os.getenv("PORT", "8000"))
-    logger.info(f"Launching server via uvicorn (1 worker process) on 0.0.0.0:{port}...")
-    uvicorn.run("rembg_server:app", host="0.0.0.0", port=port, workers=1, log_level="info")
+    # Dynamically read host and port from environment variables
+    host = os.getenv("HOST", "0.0.0.0")
+    try:
+        port = int(os.getenv("PORT", os.getenv("REMBG_PORT", "8000")))
+    except ValueError:
+        logger.warning("Invalid PORT environment variable. Falling back to default port 8000.")
+        port = 8000
+
+    logger.info(f"Launching server via uvicorn (1 worker process) on {host}:{port}...")
+    uvicorn.run("rembg_server:app", host=host, port=port, workers=1, log_level="info")
 
 
 
