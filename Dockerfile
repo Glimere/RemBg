@@ -7,7 +7,7 @@ ENV CUDA_VISIBLE_DEVICES=""
 ENV ORT_TENSORRT_UNAVAILABLE="1"
 ENV OMP_NUM_THREADS="1"
 ENV PYTHONUNBUFFERED="1"
-ENV PORT="8000"
+ENV PORT="7000"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -24,6 +24,6 @@ RUN python -c "from rembg import new_session; new_session('u2net', providers=['C
 
 COPY . .
 
-EXPOSE 8000
+EXPOSE 7000
 
 CMD ["python", "rembg_server.py"]
